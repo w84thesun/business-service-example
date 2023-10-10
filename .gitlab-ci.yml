@@ -1,0 +1,451 @@
+image: golang:1.13
+
+variables:
+  DOCKER_HOST: tcp://localhost:2375
+  GOPROXY: https://goproxy.address.com
+  GOSUMDB: "off"
+  KUBERNETES_VERSION: v1.16.4
+
+stages:
+  - lint
+  - unit-test
+  - build
+  - build-image
+  - functional-test
+  - load-test
+  - deploy
+  - cleanup
+
+
+lint:
+  image: golangci/golangci-lint:v1.23.1
+  stage: lint
+  cache:
+    key: lint
+    paths:
+      - ./mod/
+  script:
+    - extract_modules
+    - go mod download
+    - make lint
+    - save_modules_to_cache
+  tags:
+    - builder
+
+unit-test:
+  stage: unit-test
+  cache:
+    key: units
+    paths:
+      - ./mod/
+  script:
+    - extract_modules
+    - go mod download
+    - cd internal
+    - go vet $(go list ./...)
+    - go test -cover -race $(go list ./...)
+    - save_modules_to_cache
+  tags:
+    - builder
+
+build:
+  stage: build
+  cache:
+    key: build
+    paths:
+      - ./app
+      - ./mod
+  script:
+    - extract_modules
+    - make download
+    - make PROJECT_NAME=$CI_PROJECT_NAME build-service
+    - save_modules_to_cache
+  tags:
+    - builder
+
+build-image:
+  image: docker:19.03.8
+  stage: build-image
+  cache:
+    key: build
+    paths:
+      - ./app
+  services:
+    - docker:18-dind
+  script:
+    - login
+    - build_image
+  tags:
+    - builder
+
+.functional-test-template: &functional-test-definition
+  image: registry.gitlab.address.com/backend/functional-tests/master:latest
+  stage: functional-test
+  services:
+    - docker:18-dind
+    - nats-streaming:0.17.0
+  cache:
+    key: functional
+    paths:
+      - ./mod/
+  script:
+    - make migrate-functional-dbs
+    - login
+    - extract_modules
+    - go mod download
+    - REPO=$CI_APPLICATION_REPOSITORY TAG=$CI_APPLICATION_TAG make run-docker-service
+    - sleep 2
+    - docker logs $CI_PROJECT_NAME
+    - make save-docker-service-logs &
+    - PWD=$CI_PROJECT_DIR make run-functional-test
+    - make stop-docker-service
+    - save_modules_to_cache
+  artifacts:
+    paths:
+      - ./functional-test-logs.txt
+    expire_in: 7 days
+
+functional-test:
+  <<: *functional-test-definition
+  when: always
+  only:
+    - master
+    - tags
+    - /^release/.*$/
+
+functional-test-manual:
+  <<: *functional-test-definition
+  when: manual
+  except:
+    - master
+    - tags
+    - /^release/.*$/
+
+deploy-dev:
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  stage: deploy
+  script:
+    - install_dependencies
+    - create_kubeconfig $DEV_KUBECONFIG $DEV_TOKEN $DEV_KUBE_URL $DEV_CA_PEM
+    - ensure_namespace
+    - create_secret
+    - export CHART_PATH=$(pwd)/deployments/k8s/chart
+    - /apps/get-secrets
+    - deploy
+  when: manual
+  environment:
+    name: dev
+    on_stop: stop-dev
+  dependencies: []
+  tags:
+    - builder
+
+stop-dev:
+  stage: cleanup
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  script:
+    - install_dependencies
+    - create_kubeconfig $DEV_KUBECONFIG $DEV_TOKEN $DEV_KUBE_URL $DEV_CA_PEM
+    - ensure_namespace
+    - delete
+  when: manual
+  environment:
+    name: dev
+    action: stop
+  dependencies: []
+  tags:
+    - builder
+
+deploy-stage:
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  stage: deploy
+  script:
+    - install_dependencies
+    - create_kubeconfig $DEV_KUBECONFIG $STAGE_TOKEN $DEV_KUBE_URL $DEV_CA_PEM
+    - ensure_namespace
+    - create_secret
+    - export CHART_PATH=$(pwd)/deployments/k8s/chart
+    - /apps/get-secrets
+    - deploy
+  when: manual
+  environment:
+    name: stage
+    on_stop: stop-stage
+  dependencies: []
+  tags:
+    - builder
+
+stop-stage:
+  stage: cleanup
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  script:
+    - install_dependencies
+    - create_kubeconfig $DEV_KUBECONFIG $STAGE_TOKEN $DEV_KUBE_URL $DEV_CA_PEM
+    - ensure_namespace
+    - delete
+  when: manual
+  environment:
+    name: stage
+    action: stop
+  dependencies: []
+  tags:
+    - builder
+
+deploy-integration:
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  stage: deploy
+  script:
+    - install_dependencies
+    - create_kubeconfig $DEV_KUBECONFIG $INT_TOKEN $DEV_KUBE_URL $DEV_CA_PEM
+    - ensure_namespace
+    - create_secret
+    - export CHART_PATH=$(pwd)/deployments/k8s/chart
+    - /apps/get-secrets
+    - deploy
+  when: manual
+  environment:
+    name: integration
+    on_stop: stop-integration
+  dependencies: []
+  tags:
+    - builder
+  only:
+    - /^release/v.*/
+    - master
+    - tags
+
+stop-integration:
+  stage: cleanup
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  script:
+    - install_dependencies
+    - create_kubeconfig $DEV_KUBECONFIG $INT_TOKEN $DEV_KUBE_URL $DEV_CA_PEM
+    - ensure_namespace
+    - delete
+  when: manual
+  environment:
+    name: integration
+    action: stop
+  dependencies: []
+  tags:
+    - builder
+  only:
+    - /^release/v.*/
+    - master
+    - tags
+
+deploy-demo:
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  stage: deploy
+  script:
+    - install_dependencies
+    - create_kubeconfig $DEV_KUBECONFIG $DEMO_TOKEN $DEV_KUBE_URL $DEV_CA_PEM
+    - ensure_namespace
+    - create_secret
+    - export CHART_PATH=$(pwd)/deployments/k8s/chart
+    - /apps/get-secrets
+    - deploy
+  when: manual
+  environment:
+    name: demo
+    on_stop: stop-demo
+  dependencies: []
+  tags:
+    - builder
+  only:
+    - /^release/v.*/
+
+stop-demo:
+  stage: cleanup
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  script:
+    - install_dependencies
+    - create_kubeconfig $DEV_KUBECONFIG $DEMO_TOKEN $DEV_KUBE_URL $DEV_CA_PEM
+    - ensure_namespace
+    - delete
+  when: manual
+  environment:
+    name: demo
+    action: stop
+  dependencies: []
+  tags:
+    - builder
+  only:
+    - /^release/v.*/
+
+deploy-production:
+  stage: deploy
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  script:
+    - install_dependencies
+    - create_kubeconfig $PROD_KUBECONFIG $PROD_TOKEN $PROD_KUBE_URL $PROD_CA_PEM
+    - ensure_namespace
+    - create_secret
+    - export CHART_PATH=$(pwd)/deployments/k8s/chart
+    - /apps/get-secrets
+    - deploy
+  when: manual
+  environment:
+    name: production
+    on_stop: stop-production
+  dependencies: []
+  tags:
+    - production
+  only:
+    - tags
+
+stop-production:
+  stage: cleanup
+  image: registry.gitlab.address.com/backend/deploy/v1-2-0:latest
+  script:
+    - install_dependencies
+    - create_kubeconfig $PROD_KUBECONFIG $PROD_TOKEN $PROD_KUBE_URL $PROD_CA_PEM
+    - ensure_namespace
+    - delete
+  when: manual
+  environment:
+    name: production
+    action: stop
+  dependencies: []
+  tags:
+    - production
+  only:
+    - tags
+
+.dev_ops: &dev_ops |
+  export CI_APPLICATION_REPOSITORY=$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG
+  export CI_APPLICATION_REPOSITORY_TEST=${CI_APPLICATION_REPOSITORY}/test
+  export CI_APPLICATION_TAG=$CI_COMMIT_SHA
+  export CI_CONTAINER_NAME=ci_job_build_${CI_JOB_ID}
+  export TILLER_NAMESPACE=$CI_ENVIRONMENT_NAME
+
+  function extract_modules() {
+    if [[ -d ./mod ]]; then
+      echo "extracting modules cache"
+
+      if [[ ! -d $GOPATH/pkg ]]; then
+        mkdir $GOPATH/pkg
+      fi
+
+      cp -r ./mod/* $GOPATH/pkg/
+
+      rm -r ./mod
+    fi
+  }
+
+  function save_modules_to_cache() {
+    if [[ ! -d ./mod ]]; then
+      mkdir mod
+    fi
+
+    cp -r $GOPATH/pkg/* ./mod
+  }
+
+  function login() {
+    if [[ -n "$CI_REGISTRY_USER" ]]; then
+        echo "Logging to GitLab Container Registry with CI credentials..."
+        docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+        echo ""
+    fi
+  }
+
+  function build_base() {
+      if [ $# -eq 0 ] || [ $# -gt 2 ]; then
+        echo "Wrong parameters base_build"
+        return 1
+      fi
+
+      CONTAINER_NAME=$1
+      DOCKER_FILE_PATH=$2
+
+      if [[ ! -f $DOCKER_FILE_PATH ]]; then
+        echo "No Dockerfile found"
+        return 1
+      fi
+
+      echo "Building Dockerfile-based application..."
+      docker build \
+        -t "$CONTAINER_NAME:$CI_APPLICATION_TAG" \
+        --network host \
+        -f $DOCKER_FILE_PATH \
+        .
+
+      echo "Pushing to GitLab Container Registry..."
+      docker push "$CONTAINER_NAME:$CI_APPLICATION_TAG"
+      docker tag "$CONTAINER_NAME:$CI_APPLICATION_TAG" "$CONTAINER_NAME:latest"
+      docker push "$CONTAINER_NAME:latest"
+      echo ""
+  }
+
+  function build_image() {
+    build_base $CI_APPLICATION_REPOSITORY build/$CI_PROJECT_NAME/Dockerfile
+  }
+
+  function install_dependencies() {
+    echo http://mirror.yandex.ru/mirrors/alpine/v3.9/main > /etc/apk/repositories
+    apk add -U openssl curl tar gzip bash ca-certificates git
+
+    curl -LO https://storage.googleapis.com/kubernetes-release/release/${KUBERNETES_VERSION}/bin/linux/amd64/kubectl
+
+    chmod +x ./kubectl
+    mv ./kubectl /usr/bin/kubectl
+
+    kubectl version --client
+  }
+
+  function create_secret() {
+    echo "Creating Kubernetes secret..."
+
+    kubectl create secret docker-registry \
+      -n "${CI_ENVIRONMENT_NAME}" gitlab-registry \
+      --docker-server="$CI_REGISTRY" \
+      --docker-username="$REGISTRY_USER" \
+      --docker-password="$REGISTRY_PASSWORD" \
+      --docker-email="$GITLAB_USER_EMAIL" \
+      -o yaml --dry-run | kubectl replace -n "${CI_ENVIRONMENT_NAME}" --force -f -
+  }
+
+  function ensure_namespace() {
+    kubectl describe namespace "$CI_ENVIRONMENT_NAME" || kubectl create namespace "$CI_ENVIRONMENT_NAME"
+  }
+
+  function create_kubeconfig() {
+    echo "Generating kubeconfig..."
+
+    cat "$1" > "$(pwd)/kubeconfig"
+    cat "$4" > "$(pwd)/kube.ca.pem"
+
+    export KUBE_CLUSTER_OPTIONS=--certificate-authority="$(pwd)/kube.ca.pem"
+
+    kubectl config set-cluster gitlab-deploy --server="$3" \
+      $KUBE_CLUSTER_OPTIONS
+    kubectl config set-credentials gitlab-deploy --token="$2" \
+      $KUBE_CLUSTER_OPTIONS
+    kubectl config set-context gitlab-deploy \
+      --cluster=gitlab-deploy --user=gitlab-deploy \
+      --namespace="$CI_ENVIRONMENT_NAME"
+    kubectl config use-context gitlab-deploy
+    kubectl cluster-info
+  }
+
+  function deploy() {
+    echo "Deploy service on $CI_ENVIRONMENT_SLUG"
+    helm upgrade --install \
+      --wait \
+      --version="$CI_PIPELINE_ID-$CI_JOB_ID" \
+      --namespace $CI_ENVIRONMENT_NAME \
+      --set image.repository="$CI_APPLICATION_REPOSITORY" \
+      --set image.tag="$CI_APPLICATION_TAG" \
+      $CI_PROJECT_NAME \
+      $CHART_PATH
+  }
+
+  function delete() {
+    helm delete \
+      --namespace $CI_ENVIRONMENT_NAME \
+      $CI_PROJECT_NAME \
+      $CHART_PATH
+  }
+
+before_script:
+  - *dev_ops

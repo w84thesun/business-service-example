@@ -1,0 +1,1 @@
+Here we can add all information that doesn't fit into README.md
