@@ -1,10 +1,29 @@
 run:
+  timeout: 10m
   tests: false
+
 linters:
-  enable-all: true
-  disable:
+  disable-all: true
+  enable:
+    - asciicheck
+    - depguard
+    - exhaustive
+    - gci
+    - goconst
+    - godot
     - godox
-    - wsl
-    - funlen
-    - gomnd
+    - goheader
+    - goimports
+    - gomodguard
+    - gosimple
+    - govet
+    - importas
+    - ineffassign
+    - lll
+    - misspell
+    - nolintlint
+    - revive
+    - staticcheck
+    - unused
+    - whitespace
 
